@@ -42,7 +42,7 @@ Graph-grounded Hybrid RAG provides:
 
 ## Data Relationships
 
-![Comparison: Retrieval in Hybrid RAG Explained](./images/data-points-graph.png)
+![Comparison: Retrieval in Hybrid RAG Explained](./images/data-points-bm25graph.png)
 
 The following breaks down the data relationships and operational characteristics of three retrieval methodologies:
 
