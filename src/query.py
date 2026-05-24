@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""Hybrid RAG query runner (Graph grounding + vector semantic support).
+
+Replaces BM25 grounding with a Neo4j Knowledge Graph while keeping the
+vector embedding retrieval unchanged.
+
+Separation of concerns (explicit + auditable)
+-------------------------------------------
+* Graph = grounding/evidence channel (entity-anchored KG traversal)
+* Vector kNN = semantic/support channel (phrasing/terminology), optionally filtered
+  to graph-anchored documents to prevent semantic drift.
+
+Generation
+----------
+Default: 2-pass LLM
+  1) grounded draft from graph-only evidence (citations [G#])
+  2) optional rewrite for clarity using vector context (citations [V#] allowed
+     only for non-factual clarifications; factual claims must stay grounded)
+
+Observability
+-------------
+All Neo4j Cypher queries and OpenSearch vector queries can be printed (--observability)
+and/or saved as JSONL (--save-results) for auditability.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import json
+import os
+import re
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+import warnings
+
+from openai import OpenAI
+from flask import Flask, jsonify, request
+
+from common.config import load_settings
+from common.embeddings import vector_retrieve_chunks
+from common.graph import graph_retrieve_chunks, graph_retrieve_doc_anchors
+from common.llm import (
+    build_grounding_prompt,
+    build_refine_prompt,
+    build_vector_only_prompt,
+    call_llm_chat,
+    load_llm,
+)
+from common.logging import get_logger
+from common.models import RetrievalHit
+from common.named_entity import extract_entities
+from common.neo4j_client import create_graph_hot_client, create_graph_long_client, MyNeo4j
+from common.opensearch_client import create_vector_client
+
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+LOGGER = get_logger(__name__)
+
+
+# Citations are expected to be inserted inline in the answer as tags like:
+#   [G1]  (graph grounding chunk #1)
+#   [V2]  (vector chunk #2)
+# Models sometimes emit grouped citations like "[G1, G2]".
+# We therefore extract *tokens* inside any bracket/paren groups.
+_BRACKET_GROUP_RE = re.compile(r"\[([^\]]+)\]")
+_PAREN_GROUP_RE = re.compile(r"\(([^\)]+)\)")
+_CITATION_TOKEN_RE = re.compile(r"\b([GV]\d+)\b")
+
+
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Hybrid RAG query (Neo4j graph grounding + vector semantic support) with full auditability."
+    )
+    p.add_argument("--question", help="User question to answer.")
+    p.add_argument(
+        "--service",
+        action="store_true",
+        default=False,
+        help="Start the OpenAI-compatible RAG REST API instead of running a single CLI query.",
+    )
+
+    p.add_argument("--observability", action="store_true", default=False)
+    p.add_argument("--save-results", type=str, default=None, help="Append JSONL records to this path.")
+
+    # Retrieval knobs
+    p.add_argument("--top-k", type=int, default=20, help="Total evidence chunks budget.")
+
+    # NOTE: We keep the old `--bm25-k` flag as a hidden alias for convenience
+    # in existing scripts. New preferred name is --graph-k.
+    p.add_argument("--graph-k", type=int, default=None, help="Graph chunk budget (default ~60% of top-k).")
+    p.add_argument("--bm25-k", type=int, default=None, help=argparse.SUPPRESS)
+
+    p.add_argument("--vec-k", type=int, default=None, help="Vector chunk budget (default remainder).")
+    p.add_argument("--graph-doc-k", type=int, default=10, help="Doc-level graph anchors to fetch.")
+    p.add_argument("--neighbor-window", type=int, default=0, help="Add ±N adjacent chunks around graph hits.")
+    p.add_argument(
+        "--vec-filter",
+        choices=["anchor", "none"],
+        default="anchor",
+        help="Filter vector search to graph-anchored docs when possible.",
+    )
+
+    # LLM knobs
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--service-host", type=str, default=None, help="Host to bind the REST service.")
+    p.add_argument("--service-port", type=int, default=None, help="Port to bind the REST service.")
+
+    return p.parse_args(argv)
+
+
+def _extract_citations(answer: str) -> List[str]:
+    """Extract citation tokens from an LLM answer.
+
+    We expect citations like ``[G1]`` / ``[V2]``.
+    Some models emit grouped citations such as ``[G1, G2]`` or ``(G1)``.
+    """
+
+    if not answer:
+        return []
+
+    cites: set[str] = set()
+
+    for grp in _BRACKET_GROUP_RE.findall(answer):
+        for tok in _CITATION_TOKEN_RE.findall(grp):
+            cites.add(tok)
+
+    # Parentheses are more ambiguous, so only consider groups that look like citations.
+    for grp in _PAREN_GROUP_RE.findall(answer):
+        if "G" not in grp and "V" not in grp:
+            continue
+        for tok in _CITATION_TOKEN_RE.findall(grp):
+            cites.add(tok)
+
+    def _key(tag: str) -> Tuple[int, int, str]:
+        # Sort G before V, then numeric id.
+        prefix = tag[:1]
+        num = 10**9
+        try:
+            num = int(tag[1:])
+        except Exception:
+            pass
+        return (0 if prefix == "G" else 1, num, tag)
+
+    return sorted(cites, key=_key)
+
+
+def _normalize_messages(payload: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Validate and normalize chat messages from a REST request payload.
+
+    Args:
+        payload: JSON body payload.
+    Returns:
+        Normalized list of chat messages.
+    Raises:
+        ValueError: When the payload does not contain a valid messages list.
+    """
+
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("Expected non-empty 'messages' list.")
+
+    normalized: List[Dict[str, str]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            raise ValueError("Each message must be a JSON object.")
+        role = item.get("role")
+        content = item.get("content")
+        if not isinstance(role, str) or not isinstance(content, str):
+            raise ValueError("Each message requires string 'role' and 'content'.")
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def _extract_question_from_messages(messages: List[Dict[str, str]]) -> str:
+    """Extract the user question from a list of chat messages.
+
+    Args:
+        messages: Normalized chat messages.
+    Returns:
+        The most recent user message content, or the last message if no user role exists.
+    Raises:
+        ValueError: When no messages are present.
+    """
+
+    if not messages:
+        raise ValueError("No messages provided.")
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return message.get("content", "")
+    return messages[-1].get("content", "")
+
+
+def _build_chat_response(
+    *,
+    model: str,
+    content: str,
+) -> Dict[str, Any]:
+    """Format the OpenAI-compatible chat completion response payload."""
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+def _error(status: int, message: str) -> tuple[Dict[str, Any], int]:
+    """Return a JSON API error payload with the OpenAI error shape."""
+
+    return {"error": {"message": message, "type": "invalid_request_error"}}, status
+
+
+def _coerce_float(value: Any, *, default: float) -> float:
+    """Safely coerce values into floats with a fallback."""
+
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: Any, *, default: Optional[int]) -> Optional[int]:
+    """Safely coerce values into integers with a fallback."""
+
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_request_args(base_args: argparse.Namespace, payload: Dict[str, Any]) -> argparse.Namespace:
+    """Merge per-request overrides into the base CLI args.
+
+    Args:
+        base_args: Arguments provided when the service started.
+        payload: JSON body containing optional overrides.
+    Returns:
+        A new argparse.Namespace with merged values.
+    """
+
+    merged = vars(base_args).copy()
+    merged["temperature"] = _coerce_float(payload.get("temperature"), default=float(base_args.temperature))
+    merged["top_p"] = _coerce_float(payload.get("top_p"), default=float(base_args.top_p))
+    merged["top_k"] = _coerce_int(payload.get("top_k"), default=int(base_args.top_k))
+    merged["graph_k"] = _coerce_int(payload.get("graph_k"), default=base_args.graph_k)
+    merged["vec_k"] = _coerce_int(payload.get("vec_k"), default=base_args.vec_k)
+    merged["graph_doc_k"] = _coerce_int(payload.get("graph_doc_k"), default=int(base_args.graph_doc_k))
+    merged["neighbor_window"] = _coerce_int(payload.get("neighbor_window"), default=int(base_args.neighbor_window))
+    vec_filter = payload.get("vec_filter")
+    if isinstance(vec_filter, str) and vec_filter in ("anchor", "none"):
+        merged["vec_filter"] = vec_filter
+    return argparse.Namespace(**merged)
+
+
+def _resolve_service_bindings(args: argparse.Namespace) -> Tuple[str, int]:
+    """Resolve host/port settings for the REST service."""
+
+    host = args.service_host or os.getenv("RAG_AGENT_HOST", "0.0.0.0")
+    port = args.service_port or int(os.getenv("RAG_AGENT_PORT", "8002"))
+    return host, port
+
+
+# --------------------------------------------------------------------------------------
+# Orchestration
+# --------------------------------------------------------------------------------------
+
+
+def _combine_dedup_graph_hits(
+    hot_hits: List[RetrievalHit],
+    long_hits: List[RetrievalHit],
+    *,
+    k: int,
+) -> List[RetrievalHit]:
+    # Combine and keep *both* stores when the same (path, chunk) exists in each.
+    combined = list(hot_hits) + list(long_hits)
+
+    # Stable sort: score desc, prefer LONG on ties, then path/chunk.
+    def _sort_key(h: RetrievalHit) -> Tuple[float, int, str, int]:
+        score = float(h.score or 0.0)
+        prefer_long = 0 if (h.store or "").upper() == "LONG" else 1
+        ci = int(h.chunk_index) if h.chunk_index is not None else 10**9
+        return (-score, prefer_long, h.path or "", ci)
+
+    combined.sort(key=_sort_key)
+
+    seen: set[Tuple[str, str, Optional[int]]] = set()
+    uniq: List[RetrievalHit] = []
+    for h in combined:
+        key = ((h.store or "").upper(), h.path, h.chunk_index)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(h)
+        if len(uniq) >= k:
+            break
+
+    # Re-handle as G1..Gn
+    return [RetrievalHit(**{**h.to_jsonable(), "handle": f"G{i+1}"}) for i, h in enumerate(uniq)]
+
+
+def run_one(
+    question: str,
+    *,
+    graph_hot: MyNeo4j,
+    graph_long: MyNeo4j,
+    vec_client: Any,
+    llm: OpenAI,
+    args: argparse.Namespace,
+) -> Tuple[str, Dict[str, Any]]:
+    entities = extract_entities(question)
+    settings = load_settings()
+
+    vec_index = settings.opensearch_vector_index
+    if not vec_index:
+        raise RuntimeError("Could not resolve vector index name. Check settings/CLI overrides.")
+
+    # Budget split
+    top_k = int(args.top_k)
+    graph_k_cli = args.graph_k if args.graph_k is not None else args.bm25_k
+    graph_k = int(graph_k_cli) if graph_k_cli is not None else max(1, int(round(top_k * 0.6)))
+    vec_k = int(args.vec_k) if args.vec_k is not None else max(0, top_k - graph_k)
+    if graph_k + vec_k != top_k:
+        vec_k = max(0, top_k - graph_k)
+
+    # 1) doc anchors (prefer LONG first, then HOT)
+    anchor_long, graph_doc_query_long, graph_doc_raw_long = graph_retrieve_doc_anchors(
+        graph_long,
+        question=question,
+        entities=entities,
+        k=int(args.graph_doc_k),
+        observability=args.observability,
+    )
+    anchor_hot, graph_doc_query_hot, graph_doc_raw_hot = graph_retrieve_doc_anchors(
+        graph_hot,
+        question=question,
+        entities=entities,
+        k=int(args.graph_doc_k),
+        observability=args.observability,
+    )
+
+    anchor_paths: List[str] = []
+    seen_anchor: set[str] = set()
+    for pth in anchor_long + anchor_hot:
+        if pth in seen_anchor:
+            continue
+        seen_anchor.add(pth)
+        anchor_paths.append(pth)
+
+    # 2) graph grounding chunks
+    graph_hot_hits, graph_hot_chunk_query, graph_hot_chunk_raw = graph_retrieve_chunks(
+        graph_hot,
+        question=question,
+        entities=entities,
+        k=graph_k,
+        anchor_paths=anchor_paths if anchor_paths else None,
+        neighbor_window=int(args.neighbor_window),
+        observability=args.observability,
+    )
+
+    graph_long_hits, graph_long_chunk_query, graph_long_chunk_raw = graph_retrieve_chunks(
+        graph_long,
+        question=question,
+        entities=entities,
+        k=graph_k,
+        anchor_paths=anchor_paths if anchor_paths else None,
+        neighbor_window=int(args.neighbor_window),
+        observability=args.observability,
+    )
+
+    graph_hits = _combine_dedup_graph_hits(graph_hot_hits, graph_long_hits, k=graph_k)
+
+    # 3) vector chunks (unchanged)
+    vec_anchor_paths: Optional[List[str]] = None
+    if args.vec_filter == "anchor" and len(anchor_paths) >= 2:
+        vec_anchor_paths = anchor_paths
+
+    vec_hits: List[RetrievalHit] = []
+    vec_query: Dict[str, Any] = {}
+    vec_raw: List[Dict[str, Any]] = []
+    if vec_k > 0:
+        vec_hits, vec_query, vec_raw = vector_retrieve_chunks(
+            vec_client,
+            vec_index,
+            question=question,
+            anchor_paths=vec_anchor_paths,
+            k=vec_k,
+            candidate_k=max(vec_k * 5, 50),
+            observability=args.observability,
+            vector_field="embedding",
+        )
+        # deterministic top-up if anchor filter starves results
+        if vec_anchor_paths and len(vec_hits) < vec_k:
+            topup, _, _ = vector_retrieve_chunks(
+                vec_client,
+                vec_index,
+                question=question,
+                anchor_paths=None,
+                k=vec_k * 2,
+                candidate_k=max(vec_k * 10, 100),
+                observability=args.observability,
+                vector_field="embedding",
+            )
+            seen_vec = {(h.path, h.chunk_index) for h in vec_hits}
+            for h in topup:
+                key = (h.path, h.chunk_index)
+                if key in seen_vec:
+                    continue
+                vec_hits.append(h)
+                seen_vec.add(key)
+                if len(vec_hits) >= vec_k:
+                    break
+            vec_hits = [RetrievalHit(**{**h.to_jsonable(), "handle": f"V{i+1}"}) for i, h in enumerate(vec_hits)]
+
+    if args.observability:
+        print("\n[ENTITIES]", entities)
+        print(f"\n[ANCHORS] {len(anchor_paths)}")
+        for pth in anchor_paths[:10]:
+            print("  -", pth)
+        print(f"\n[GRAPH_HOT_HITS] {len(graph_hot_hits)}")
+        for h in graph_hot_hits[: min(10, len(graph_hot_hits))]:
+            print(f"  {h.handle} score={h.score:.3f} chunk={h.chunk_index} path={h.path}")
+        print(f"\n[GRAPH_LONG_HITS] {len(graph_long_hits)}")
+        for h in graph_long_hits[: min(10, len(graph_long_hits))]:
+            print(f"  {h.handle} score={h.score:.3f} chunk={h.chunk_index} path={h.path}")
+        print(f"\n[GRAPH_COMBINED_HITS] {len(graph_hits)}")
+        for h in graph_hits[: min(10, len(graph_hits))]:
+            print(f"  {h.handle} store={h.store} score={h.score:.3f} chunk={h.chunk_index} path={h.path}")
+        print(f"\n[VEC_HITS] {len(vec_hits)} filter={'ON' if vec_anchor_paths else 'OFF'}")
+        for h in vec_hits[: min(10, len(vec_hits))]:
+            print(f"  {h.handle} score={h.score:.3f} chunk={h.chunk_index} path={h.path}")
+
+    # Generation
+    model = settings.llm_server_model
+    max_tokens = settings.llama_ctx
+    temperature = float(args.temperature)
+    top_p = float(args.top_p)
+
+    grounded_draft: Optional[str] = None
+    if graph_hits:
+        msgs_a = build_grounding_prompt(question, graph_hits=graph_hits, observability=args.observability)
+    else:
+        # no graph evidence, use vector-only evidence (still citation-restricted)
+        msgs_a = build_vector_only_prompt(question, vec_hits=vec_hits, observability=args.observability)
+
+    grounded_draft = call_llm_chat(
+        llm,
+        messages=msgs_a,
+        model=model,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+    )
+
+    if graph_hits and vec_hits:
+        msgs_b = build_refine_prompt(
+            question,
+            grounded_draft=grounded_draft,
+            vec_hits=vec_hits,
+            observability=args.observability,
+        )
+        answer = call_llm_chat(
+            llm,
+            messages=msgs_b,
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
+    else:
+        answer = grounded_draft
+
+    citations = _extract_citations(answer)
+
+    audit: Dict[str, Any] = {
+        "question": question,
+        "entities": entities,
+        "indices": {
+            "neo4j_long": {"uri": graph_long.settings.neo4j_long_uri, "db": graph_long.database},
+            "neo4j_hot": {"uri": graph_hot.settings.neo4j_hot_uri, "db": graph_hot.database},
+            "vector_chunks": vec_index,
+        },
+        "retrieval": {
+            "anchor_paths": anchor_paths,
+            "graph_doc_query_long": graph_doc_query_long,
+            "graph_doc_query_hot": graph_doc_query_hot,
+            "graph_doc_records_long": graph_doc_raw_long,
+            "graph_doc_records_hot": graph_doc_raw_hot,
+            "graph_hot_chunk_query": graph_hot_chunk_query,
+            "graph_long_chunk_query": graph_long_chunk_query,
+            "vector_query": vec_query,
+            "graph_hot_hits": [h.to_jsonable() for h in graph_hot_hits],
+            "graph_long_hits": [h.to_jsonable() for h in graph_long_hits],
+            "graph_combined_hits": [h.to_jsonable() for h in graph_hits],
+            "graph_hot_raw": graph_hot_chunk_raw,
+            "graph_long_raw": graph_long_chunk_raw,
+            "vector_hits": [h.to_jsonable() for h in vec_hits],
+            "vector_raw": vec_raw,
+        },
+        "generation": {
+            "model": model,
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+            "grounded_draft": grounded_draft,
+            "final_answer": answer,
+            "citations_in_answer": citations,
+        },
+    }
+
+    return answer, audit
+
+
+def append_jsonl(path: str, record: Dict[str, Any]) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def run_queries(questions: List[str], *, args: argparse.Namespace) -> None:
+    graph_hot = create_graph_hot_client()
+    graph_long = create_graph_long_client()
+    vec_client, _ = create_vector_client()
+    llm = load_llm()
+
+    for question in questions:
+        print("\n" + "=" * 100)
+        print(f"QUESTION: {question}")
+        print("=" * 100)
+
+        start = time.time()
+        answer, audit = run_one(
+            question,
+            graph_hot=graph_hot,
+            graph_long=graph_long,
+            vec_client=vec_client,
+            llm=llm,
+            args=args,
+        )
+        elapsed = time.time() - start
+
+        print("\n" + "=" * 100)
+        print("ANSWER:")
+        print(answer)
+        print("\n" + "=" * 100)
+        print(f"Query time: {elapsed:.2f}s")
+
+        cites = audit.get("generation", {}).get("citations_in_answer", []) or []
+        print("\nCitations used in answer:", ", ".join(cites) if cites else "(none)")
+
+        if args.save_results:
+            audit["timing_s"] = elapsed
+            audit["created_at_ms"] = int(time.time() * 1000)
+            append_jsonl(args.save_results, audit)
+            print(f"\nSaved JSONL record to: {args.save_results}")
+
+    graph_hot.close()
+    graph_long.close()
+
+
+@dataclass
+class ServiceResources:
+    """Runtime dependencies needed to answer RAG service requests."""
+
+    graph_hot: MyNeo4j
+    graph_long: MyNeo4j
+    vec_client: Any
+    llm: OpenAI
+
+    def close(self) -> None:
+        """Close any open resources."""
+
+        self.graph_hot.close()
+        self.graph_long.close()
+
+
+def _init_service_resources() -> ServiceResources:
+    """Initialize shared service dependencies for request handling."""
+
+    graph_hot = create_graph_hot_client()
+    graph_long = create_graph_long_client()
+    vec_client, _ = create_vector_client()
+    llm = load_llm()
+    return ServiceResources(
+        graph_hot=graph_hot,
+        graph_long=graph_long,
+        vec_client=vec_client,
+        llm=llm,
+    )
+
+
+def create_service_app(args: argparse.Namespace) -> Flask:
+    """Create the Flask app that serves the OpenAI-compatible RAG endpoint."""
+
+    app = Flask(__name__)
+    settings = load_settings()
+    resources = _init_service_resources()
+    app.config["RAG_RESOURCES"] = resources
+    atexit.register(resources.close)
+
+    @app.route("/health", methods=["GET"])
+    def health() -> tuple[Dict[str, Any], int]:
+        host, port = _resolve_service_bindings(args)
+        return jsonify(
+            {
+                "status": "ok",
+                "model": settings.llm_server_model,
+                "server": {
+                    "host": host,
+                    "port": port,
+                },
+            }
+        ), 200
+
+    @app.route("/v1/models", methods=["GET"])
+    def models() -> tuple[Dict[str, Any], int]:
+        return jsonify(
+            {
+                "object": "list",
+                "data": [
+                    {
+                        "id": settings.llm_server_model,
+                        "object": "model",
+                        "created": int(time.time()),
+                        "owned_by": "local",
+                    }
+                ],
+            }
+        ), 200
+
+    @app.route("/v1/chat/completions", methods=["POST"])
+    def chat_completions() -> tuple[Dict[str, Any], int]:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return _error(400, "Expected JSON object payload.")
+
+        if payload.get("stream") is True:
+            return _error(400, "Streaming responses are not supported.")
+
+        try:
+            messages = _normalize_messages(payload)
+            question = _extract_question_from_messages(messages)
+        except ValueError as exc:
+            return _error(400, str(exc))
+
+        request_args = _build_request_args(args, payload)
+        model = str(payload.get("model") or settings.llm_server_model)
+
+        answer, _audit = run_one(
+            question,
+            graph_hot=resources.graph_hot,
+            graph_long=resources.graph_long,
+            vec_client=resources.vec_client,
+            llm=resources.llm,
+            args=request_args,
+        )
+        return jsonify(_build_chat_response(model=model, content=answer)), 200
+
+    return app
+
+
+def run_service(args: argparse.Namespace) -> None:
+    """Run the OpenAI-compatible RAG REST service."""
+
+    app = create_service_app(args)
+    host, port = _resolve_service_bindings(args)
+    app.run(host=host, port=port, debug=False)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+
+    if args.service:
+        run_service(args)
+        return
+
+    questions: List[str]
+    if args.question:
+        questions = [args.question]
+    else:
+        # Keep default examples neutral to avoid injecting unrelated entities.
+        questions = [
+            "How much did OpenAI purchase Windsurf for?",
+            "How much did Google purchase Windsurf for?",
+        ]
+
+    run_queries(questions, args=args)
+
+
+if __name__ == "__main__":
+    main()
